@@ -63,22 +63,37 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-// Create uploads directory
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-app.use('/uploads', express.static(uploadsDir));
+// Configure multer with memory storage for cloud deployment
+const storage = multer.memoryStorage();
+const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB limit for base64
 
-// Configure multer
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadsDir),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${uuidv4()}${ext}`);
+// Helper function to convert buffer to base64 data URL
+function bufferToDataUrl(buffer, mimetype) {
+  return `data:${mimetype};base64,${buffer.toString('base64')}`;
+}
+
+// Serve uploaded files from MongoDB (for backwards compatibility)
+app.get('/uploads/:fileId', async (req, res) => {
+  try {
+    const file = await db.collection('files').findOne({ _id: req.params.fileId });
+    if (!file) {
+      return res.status(404).send('File not found');
+    }
+    
+    const matches = file.data.match(/^data:(.+);base64,(.+)$/);
+    if (matches) {
+      const mimeType = matches[1];
+      const base64Data = matches[2];
+      const buffer = Buffer.from(base64Data, 'base64');
+      res.set('Content-Type', mimeType);
+      res.send(buffer);
+    } else {
+      res.status(400).send('Invalid file format');
+    }
+  } catch (error) {
+    res.status(500).send('Error retrieving file');
   }
 });
-const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
 
 // ============ AUTH ROUTES ============
 
@@ -310,14 +325,15 @@ app.post('/api/users/:userId/avatar', upload.single('avatar'), async (req, res) 
       return res.status(400).json({ error: 'No file uploaded' });
     }
     
-    const avatarPath = `/uploads/${req.file.filename}`;
+    // Convert to base64 data URL and store directly
+    const avatarDataUrl = bufferToDataUrl(req.file.buffer, req.file.mimetype);
     
     await db.collection('users').updateOne(
       { _id: req.params.userId },
-      { $set: { avatar: avatarPath } }
+      { $set: { avatar: avatarDataUrl } }
     );
     
-    res.json({ avatar: avatarPath });
+    res.json({ avatar: avatarDataUrl });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -329,14 +345,15 @@ app.post('/api/users/:userId/banner', upload.single('banner'), async (req, res) 
       return res.status(400).json({ error: 'No file uploaded' });
     }
     
-    const bannerPath = `/uploads/${req.file.filename}`;
+    // Convert to base64 data URL and store directly
+    const bannerDataUrl = bufferToDataUrl(req.file.buffer, req.file.mimetype);
     
     await db.collection('users').updateOne(
       { _id: req.params.userId },
-      { $set: { banner: bannerPath } }
+      { $set: { banner: bannerDataUrl } }
     );
     
-    res.json({ banner: bannerPath });
+    res.json({ banner: bannerDataUrl });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1372,17 +1389,18 @@ app.put('/api/servers/:serverId/icon', upload.single('icon'), async (req, res) =
       return res.status(400).json({ error: 'No file uploaded' });
     }
     
-    const iconUrl = `/uploads/${req.file.filename}`;
+    // Convert to base64 data URL and store directly
+    const iconDataUrl = bufferToDataUrl(req.file.buffer, req.file.mimetype);
     
     await db.collection('servers').updateOne(
       { _id: req.params.serverId },
-      { $set: { icon: iconUrl } }
+      { $set: { icon: iconDataUrl } }
     );
     
     // Notify all members
-    io.emit('server-updated', { serverId: req.params.serverId, icon: iconUrl });
+    io.emit('server-updated', { serverId: req.params.serverId, icon: iconDataUrl });
     
-    res.json({ success: true, icon: iconUrl });
+    res.json({ success: true, icon: iconDataUrl });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1470,19 +1488,37 @@ app.get('/api/servers/:serverId/invite', async (req, res) => {
   }
 });
 
-// File upload
-app.post('/api/upload', upload.single('file'), (req, res) => {
+// File upload (for message attachments)
+app.post('/api/upload', upload.single('file'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded' });
   }
   
-  res.json({
-    url: `/uploads/${req.file.filename}`,
-    filename: req.file.filename,
-    originalName: req.file.originalname,
-    mimetype: req.file.mimetype,
-    size: req.file.size
-  });
+  try {
+    // Convert to base64 data URL
+    const dataUrl = bufferToDataUrl(req.file.buffer, req.file.mimetype);
+    const fileId = uuidv4();
+    
+    // Store in MongoDB files collection
+    await db.collection('files').insertOne({
+      _id: fileId,
+      data: dataUrl,
+      originalName: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+      createdAt: new Date()
+    });
+    
+    res.json({
+      url: `/uploads/${fileId}`,
+      filename: fileId,
+      originalName: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // ============ SOCKET.IO ============
